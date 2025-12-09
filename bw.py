@@ -61,17 +61,18 @@ def get_clean_item(item):
     item_copy = item.copy()
     # Remove fields that change or are irrelevant for content matching
     fields_to_remove = [
-        "id",
-        "organizationId",
-        "collectionIds",
-        "revisionDate",
         "attachments",
-        "folderId",
+        "collectionIds",
         "creationDate",
         "deletedDate",
-        "passwordRevisionDate",
+        "folderId",
+        # "history", # TODO should we include this?
+        "id",
         "object",
+        "organizationId",
         "passwordHistory",
+        "passwordRevisionDate",
+        "revisionDate",
     ]
     for field in fields_to_remove:
         item_copy.pop(field, None)
