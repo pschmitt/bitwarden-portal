@@ -4,7 +4,7 @@ import hashlib
 import sys
 
 
-def get_item_hash(item):
+def get_item_hash(item, debug=False):
     # Create a copy to modify
     item_copy = item.copy()
     # Remove fields that change or are irrelevant for content matching
@@ -13,18 +13,26 @@ def get_item_hash(item):
     # collectionIds: might change
     # revisionDate: changes
     # attachments: we are handling them separately, and they might not be present/same yet
+    # folderId: changes on import if folders are recreated
+    # creationDate: changes on import
+    # deletedDate: might differ
     fields_to_remove = [
         "id",
         "organizationId",
         "collectionIds",
         "revisionDate",
         "attachments",
+        "folderId",
+        "creationDate",
+        "deletedDate",
     ]
     for field in fields_to_remove:
         item_copy.pop(field, None)
 
     # Sort keys to ensure consistent JSON string
     item_str = json.dumps(item_copy, sort_keys=True)
+    if debug:
+        sys.stderr.write(f"DEBUG HASH INPUT for {item.get('id')}: {item_str}\n")
     return hashlib.sha256(item_str.encode("utf-8")).hexdigest()
 
 
@@ -57,13 +65,23 @@ def main(source_file, dest_file):
     for item in dest_items:
         if "id" in item:
             h = get_item_hash(item)
-            dest_map[h] = item["id"]
+            if h not in dest_map:
+                dest_map[h] = []
+            dest_map[h].append(item["id"])
 
+    debug_count = 0
     for item in source_items:
         if "id" in item:
             h = get_item_hash(item)
-            if h in dest_map:
-                print(f"{item['id']}\t{dest_map[h]}")
+            if h in dest_map and dest_map[h]:
+                # Pop the first matching ID to handle duplicates correctly
+                dest_id = dest_map[h].pop(0)
+                print(f"{item['id']}\t{dest_id}")
+            else:
+                if debug_count < 3:
+                    sys.stderr.write(f"DEBUG: No match for source item {item['id']}\n")
+                    get_item_hash(item, debug=True)
+                    debug_count += 1
 
 
 if __name__ == "__main__":
