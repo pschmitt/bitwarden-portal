@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+
 import argparse
 import base64
 import hashlib
@@ -60,20 +61,50 @@ def get_clean_item(item):
     item_copy = item.copy()
     # Remove fields that change or are irrelevant for content matching
     fields_to_remove = [
-        "attachments",
+        "id",
+        "organizationId",
         "collectionIds",
+        "revisionDate",
+        "attachments",
+        "folderId",
         "creationDate",
         "deletedDate",
-        "folderId",
-        "id",
-        "object",
-        "organizationId",
-        "passwordHistory",
         "passwordRevisionDate",
-        "revisionDate",
+        "object",
+        "passwordHistory",
     ]
     for field in fields_to_remove:
         item_copy.pop(field, None)
+
+    # Sort lists to ensure deterministic order
+    if item_copy.get("login") and isinstance(item_copy["login"], dict):
+        if item_copy["login"].get("uris") and isinstance(
+            item_copy["login"]["uris"], list
+        ):
+            # Sort by URI string to ensure deterministic order
+            item_copy["login"]["uris"] = sorted(
+                item_copy["login"]["uris"],
+                key=lambda x: (x.get("uri", "") or "", x.get("match", 0) or 0),
+            )
+        if item_copy["login"].get("fido2Credentials") and isinstance(
+            item_copy["login"]["fido2Credentials"], list
+        ):
+            item_copy["login"]["fido2Credentials"] = sorted(
+                item_copy["login"]["fido2Credentials"],
+                key=lambda x: (x.get("credentialId", "") or ""),
+            )
+
+    if item_copy.get("fields") and isinstance(item_copy["fields"], list):
+        # Sort fields by name, value, and type
+        item_copy["fields"] = sorted(
+            item_copy["fields"],
+            key=lambda x: (
+                x.get("name", "") or "",
+                str(x.get("value", "") or ""),
+                x.get("type", 0) or 0,
+            ),
+        )
+
     return item_copy
 
 
@@ -137,36 +168,60 @@ def action_match(args):
                 dest_id = dest_map[h].pop(0)
                 print(f"{item['id']}\t{dest_id}")
             else:
-                if debug_count < 3:
-                    sys.stderr.write(
-                        f"DEBUG: No match for source item {item['id']} ({item.get('name')})\n"
-                    )
-                    # Try to find a candidate by name
-                    name = item.get("name")
-                    if name and name in dest_name_map:
-                        candidates = dest_name_map[name]
+                # Fallback: Try unique name match
+                name = item.get("name")
+                matched_by_name = False
+                if name and name in dest_name_map:
+                    candidates = dest_name_map[name]
+                    # Filter candidates that are still available in dest_map
+                    available_candidates = []
+                    for cand in candidates:
+                        cand_h = get_item_hash(cand)
+                        if cand_h in dest_map and cand["id"] in dest_map[cand_h]:
+                            available_candidates.append(cand)
+
+                    if len(available_candidates) == 1:
+                        dest_item = available_candidates[0]
+                        dest_h = get_item_hash(dest_item)
+                        dest_map[dest_h].remove(dest_item["id"])
+                        print(f"{item['id']}\t{dest_item['id']}")
+                        matched_by_name = True
+
+                if not matched_by_name:
+                    if debug_count < 3:
                         sys.stderr.write(
-                            f"DEBUG: Found {len(candidates)} candidates with same name.\n"
+                            f"DEBUG: No match for source item {item['id']} ({item.get('name')})\n"
                         )
-                        for cand in candidates:
-                            src_clean = get_clean_item(item)
-                            dst_clean = get_clean_item(cand)
-
-                            src_str = json.dumps(src_clean, sort_keys=True, indent=2)
-                            dst_str = json.dumps(dst_clean, sort_keys=True, indent=2)
-
-                            # Only show diff if they are "close" enough?
-                            # For now, just showing diff for same-named items is a good heuristic for "close"
-                            diff = difflib.unified_diff(
-                                src_str.splitlines(),
-                                dst_str.splitlines(),
-                                fromfile=f"Source {item['id']}",
-                                tofile=f"Dest {cand['id']}",
-                                lineterm="",
+                        # Try to find a candidate by name
+                        name = item.get("name")
+                        if name and name in dest_name_map:
+                            candidates = dest_name_map[name]
+                            sys.stderr.write(
+                                f"DEBUG: Found {len(candidates)} candidates with same name.\n"
                             )
-                            for line in diff:
-                                sys.stderr.write(f"DIFF: {line}\n")
-                    debug_count += 1
+                            for cand in candidates:
+                                src_clean = get_clean_item(item)
+                                dst_clean = get_clean_item(cand)
+
+                                src_str = json.dumps(
+                                    src_clean, sort_keys=True, indent=2
+                                )
+                                dst_str = json.dumps(
+                                    dst_clean, sort_keys=True, indent=2
+                                )
+
+                                # Only show diff if they are "close" enough?
+                                # For now, just showing diff for same-named items is a good heuristic for "close"
+                                diff = difflib.unified_diff(
+                                    src_str.splitlines(),
+                                    dst_str.splitlines(),
+                                    fromfile=f"Source {item['id']}",
+                                    tofile=f"Dest {cand['id']}",
+                                    lineterm="",
+                                )
+                                for line in diff:
+                                    sys.stderr.write(f"DIFF: {line}\n")
+                        debug_count += 1
 
 
 # -----------------------------------------------------------------------------
