@@ -33,7 +33,7 @@ encrypt_file() {
         echo "✕ Error: Failed to encrypt file $input_file."
         exit 1
     fi
-    
+
     echo "# Encryption successful: $output_file_name."
 }
 
@@ -84,11 +84,11 @@ export_attachments() {
     # Build list of attachments to download with item_id, att_id, att_name
     local download_list
     download_list=$(mktemp)
-    
+
     while IFS= read -r item_data; do
         local item_id
         item_id=$(jq -r '.id' <<< "$item_data")
-        
+
         jq -r --arg item_id "$item_id" '.attachments[] | "\($item_id)\t\(.id)\t\(.fileName)"' <<< "$item_data"
     done <<< "$items_with_attachments" > "$download_list"
 
@@ -129,10 +129,10 @@ restore_attachments() {
         if [ ! -d "$item_dir" ]; then
             continue
         fi
-        
+
         local item_id
         item_id=$(basename "$item_dir")
-        
+
         for att_file in "$item_dir"/*; do
             if [ -f "$att_file" ]; then
                 echo "$item_id"$'\t'"$att_file" >> "$upload_list"
@@ -141,7 +141,7 @@ restore_attachments() {
     done
 
     # Upload attachments in parallel
-    cat "$upload_list" | xargs -P 200 -I {} bash -c '
+    cat "$upload_list" | xargs --verbose -P 10 -I {} bash -c '
         IFS=$'"'"'\t'"'"' read -r item_id att_file <<< "{}"
         bw --session "'"$session"'" create attachment --file "$att_file" --itemid "$item_id" 2>/dev/null
     '
@@ -212,7 +212,7 @@ trap cleanup_unencrypted SIGINT SIGTERM EXIT
 # INIT #
 #------#
 
-# Create folder if not exists 
+# Create folder if not exists
 SOURCE_FOLDER="/app/backups/source"
 DEST_FOLDER="/app/backups/dest"
 
