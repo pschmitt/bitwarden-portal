@@ -46,6 +46,7 @@ RUN echo "$CRON_SCHEDULE root /app/backup.sh > /var/log/cron.log 2>&1" > /etc/cr
 COPY ./bw-purge-vault.sh /app/bw-purge-vault.sh
 COPY ./bw-master-password-hash.sh /app/bw-master-password-hash.sh
 COPY ./bitwarden-portal.sh /app/backup.sh
+COPY ./bw_match_items.py /app/bw_match_items.py
 
 # Copy custom SSL certificates
 COPY ./certs/* /usr/local/share/ca-certificates/

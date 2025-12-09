@@ -7,4 +7,5 @@ services:
     volumes:
       - ./backups:/app/backups
       - ./bitwarden-portal.sh:/app/backup.sh:ro
+      - ./bw_match_items.py:/app/bw_match_items.py:ro
     restart: unless-stopped

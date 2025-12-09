@@ -107,6 +107,7 @@ export_attachments() {
 restore_attachments() {
     local session="$1"
     local attachments_folder="$2"
+    local mapping_file="$3"
 
     if [ ! -d "$attachments_folder" ] || [ -z "$(ls -A "$attachments_folder" 2>/dev/null)" ]; then
         return 0
@@ -121,6 +122,14 @@ restore_attachments() {
 
     echo "# Restoring attachments for $total_items items..."
 
+    # Load mapping
+    declare -A id_map
+    if [ -n "$mapping_file" ] && [ -f "$mapping_file" ]; then
+        while IFS=$'\t' read -r src_id dst_id; do
+            id_map["$src_id"]="$dst_id"
+        done < "$mapping_file"
+    fi
+
     # Build list of attachments to upload: item_id, att_file_path
     local upload_list
     upload_list=$(mktemp)
@@ -130,12 +139,23 @@ restore_attachments() {
             continue
         fi
 
-        local item_id
-        item_id=$(basename "$item_dir")
+        local source_item_id
+        source_item_id=$(basename "$item_dir")
+        local dest_item_id="$source_item_id"
+
+        # If mapping exists, use it
+        if [ -n "$mapping_file" ]; then
+            if [ -n "${id_map[$source_item_id]}" ]; then
+                dest_item_id="${id_map[$source_item_id]}"
+            else
+                echo "Warning: Could not find destination item for source item $source_item_id. Skipping attachments."
+                continue
+            fi
+        fi
 
         for att_file in "$item_dir"/*; do
             if [ -f "$att_file" ]; then
-                echo "$item_id"$'\t'"$att_file" >> "$upload_list"
+                echo "$dest_item_id"$'\t'"$att_file" >> "$upload_list"
             fi
         done
     done
@@ -541,7 +561,19 @@ echo "# Decrypted backup imported."
 # Restore attachments if they exist
 RESTORE_ATTACHMENTS_FOLDER="$RESTORE_EXTRACT_DIR/source"
 if [ -d "$RESTORE_ATTACHMENTS_FOLDER" ]; then
-    restore_attachments "$DEST_SESSION" "$RESTORE_ATTACHMENTS_FOLDER"
+    # Export destination items to get new IDs
+    DEST_ITEMS_AFTER_IMPORT="$TEMP_FOLDER/dest_items_after_import.json"
+    echo "# Exporting destination items to map IDs..."
+    bw --session "$DEST_SESSION" list items > "$DEST_ITEMS_AFTER_IMPORT"
+
+    # Generate ID mapping
+    ID_MAPPING_FILE="$TEMP_FOLDER/id_mapping.tsv"
+    echo "# Generating item ID mapping..."
+    python3 "$SCRIPT_DIR/bw_match_items.py" "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" "$DEST_ITEMS_AFTER_IMPORT" > "$ID_MAPPING_FILE"
+
+    restore_attachments "$DEST_SESSION" "$RESTORE_ATTACHMENTS_FOLDER" "$ID_MAPPING_FILE"
+
+    rm -f "$DEST_ITEMS_AFTER_IMPORT" "$ID_MAPPING_FILE"
 fi
 
 # Remove the decrypted files
