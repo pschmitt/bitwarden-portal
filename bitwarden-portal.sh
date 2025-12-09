@@ -1,5 +1,7 @@
 #!/bin/bash
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+
 TIMESTAMP=$(date "+%Y-%m-%d_%H-%M-%S")
 
 #-------------------#
@@ -55,6 +57,98 @@ decrypt_file() {
     echo "# Decryption successful: $output_file_name."
 }
 
+export_attachments() {
+    local session="$1"
+    local items_json="$2"
+    local dest_folder="$3"
+
+    local items_with_attachments
+    items_with_attachments=$(jq -c '.items[] | select(.attachments != null and (.attachments | length) > 0)' "$items_json")
+
+    if [ -z "$items_with_attachments" ]; then
+        return 0
+    fi
+
+    local total_items
+    total_items=$(wc -l <<< "$items_with_attachments")
+
+    echo "# Exporting attachments from $total_items items..."
+
+    # Create all directories first
+    while IFS= read -r item_data; do
+        local item_id
+        item_id=$(jq -r '.id' <<< "$item_data")
+        mkdir -p "$dest_folder/$item_id"
+    done <<< "$items_with_attachments"
+
+    # Build list of attachments to download with item_id, att_id, att_name
+    local download_list
+    download_list=$(mktemp)
+    
+    while IFS= read -r item_data; do
+        local item_id
+        item_id=$(jq -r '.id' <<< "$item_data")
+        
+        jq -r --arg item_id "$item_id" '.attachments[] | "\($item_id)\t\(.id)\t\(.fileName)"' <<< "$item_data"
+    done <<< "$items_with_attachments" > "$download_list"
+
+    # Download attachments in parallel
+    cat "$download_list" | xargs -P 200 -I {} bash -c '
+        IFS=$'"'"'\t'"'"' read -r item_id att_id att_name <<< "{}"
+        att_dest="'"$dest_folder"'/$item_id/$att_name"
+        if [ ! -e "$att_dest" ]; then
+            bw --session "'"$session"'" get attachment "$att_id" --itemid "$item_id" --output "$att_dest" --raw 2>/dev/null
+        fi
+    '
+
+    rm -f "$download_list"
+}
+
+restore_attachments() {
+    local session="$1"
+    local attachments_folder="$2"
+
+    if [ ! -d "$attachments_folder" ] || [ -z "$(ls -A "$attachments_folder" 2>/dev/null)" ]; then
+        return 0
+    fi
+
+    local total_items
+    total_items=$(find "$attachments_folder" -mindepth 1 -maxdepth 1 -type d | wc -l)
+
+    if [ "$total_items" -eq 0 ]; then
+        return 0
+    fi
+
+    echo "# Restoring attachments for $total_items items..."
+
+    # Build list of attachments to upload: item_id, att_file_path
+    local upload_list
+    upload_list=$(mktemp)
+
+    for item_dir in "$attachments_folder"/*; do
+        if [ ! -d "$item_dir" ]; then
+            continue
+        fi
+        
+        local item_id
+        item_id=$(basename "$item_dir")
+        
+        for att_file in "$item_dir"/*; do
+            if [ -f "$att_file" ]; then
+                echo "$item_id"$'\t'"$att_file" >> "$upload_list"
+            fi
+        done
+    done
+
+    # Upload attachments in parallel
+    cat "$upload_list" | xargs -P 200 -I {} bash -c '
+        IFS=$'"'"'\t'"'"' read -r item_id att_file <<< "{}"
+        bw --session "'"$session"'" create attachment --file "$att_file" --itemid "$item_id" 2>/dev/null
+    '
+
+    rm -f "$upload_list"
+}
+
 purge_folder() {
     local folder_path="$1"
     local max_files="$2"
@@ -107,6 +201,7 @@ purge_folder() {
 cleanup_unencrypted() {
     echo "# Cleaning up all unencrypted backup files from temporary folder ($TEMP_FOLDER)..."
     rm -f "$TEMP_FOLDER"/*.json
+    rm -rf "$ATTACHMENTS_FOLDER"
 }
 
 # Set traps to ensure cleanup is performed on exit or error
@@ -143,9 +238,18 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
+# Create temporary folder for attachments
+ATTACHMENTS_FOLDER="$TEMP_FOLDER/attachments"
+mkdir -p "$ATTACHMENTS_FOLDER"
+if [ $? -ne 0 ]; then
+    echo "✕ Error: Failed to create attachments folder $ATTACHMENTS_FOLDER."
+    exit 1
+fi
+
 # Clean up any existing unencrypted backup files from TEMP_FOLDER
 echo "# Cleaning up any existing unencrypted backup files..."
 rm -f "$TEMP_FOLDER"/*.json
+rm -rf "$ATTACHMENTS_FOLDER"/*
 
 echo "########## Start of Backup process ##########"
 
@@ -232,17 +336,42 @@ fi
 
 fix_permissions "$PUID" "$PGID" "$SOURCE_OUTPUT_FILE_PATH"
 
+# Export list of items with attachment metadata
+SOURCE_ITEMS_LIST="$TEMP_FOLDER/bw_items_source_$TIMESTAMP.json"
+echo "# Exporting item list (for attachment metadata)..."
+bw --session "$SOURCE_SESSION" list items > "$SOURCE_ITEMS_LIST"
+
+if [ $? -ne 0 ]; then
+    echo "✕ Error: Failed to list items."
+    exit 1
+fi
+
+# Wrap items list in export format for export_attachments function
+SOURCE_ITEMS_WRAPPED="$TEMP_FOLDER/bw_items_wrapped_$TIMESTAMP.json"
+jq '{items: .}' "$SOURCE_ITEMS_LIST" > "$SOURCE_ITEMS_WRAPPED"
+
+# Export attachments
+SOURCE_ATTACHMENTS_FOLDER="$ATTACHMENTS_FOLDER/source"
+mkdir -p "$SOURCE_ATTACHMENTS_FOLDER"
+export_attachments "$SOURCE_SESSION" "$SOURCE_ITEMS_WRAPPED" "$SOURCE_ATTACHMENTS_FOLDER"
+
 #-----------------------#
 # SOURCE EXPORT ENCRYPT #
 #-----------------------#
 
-# Encrypt the exported file
-encrypt_file "$SOURCE_OUTPUT_FILE_PATH" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
+# Create tarball with export and attachments
+SOURCE_TARBALL="$TEMP_FOLDER/bw_backup_source_$TIMESTAMP.tar.gz"
+echo "# Creating backup tarball with attachments..."
+tar -czf "$SOURCE_TARBALL" -C "$TEMP_FOLDER" "$(basename "$SOURCE_OUTPUT_FILE_PATH")" -C "$ATTACHMENTS_FOLDER" source 2>/dev/null || tar -czf "$SOURCE_TARBALL" -C "$TEMP_FOLDER" "$(basename "$SOURCE_OUTPUT_FILE_PATH")"
+
+# Encrypt the tarball
+encrypt_file "$SOURCE_TARBALL" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
 fix_permissions "$PUID" "$PGID" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH"
 
-# Remove the unencrypted file
-echo "# Removed unencrypted file."
-rm -f "$SOURCE_OUTPUT_FILE_PATH"
+# Remove the unencrypted files
+echo "# Removed unencrypted files."
+rm -f "$SOURCE_OUTPUT_FILE_PATH" "$SOURCE_ITEMS_LIST" "$SOURCE_ITEMS_WRAPPED" "$SOURCE_TARBALL"
+rm -rf "$SOURCE_ATTACHMENTS_FOLDER"
 
 sleep 1
 
@@ -353,76 +482,17 @@ sleep 1
 # DEST REMOVE OLD #
 #-----------------#
 
-# Find and remove all folders, items, attachments, and org collections
-echo "# Removing items from the destination vault... This might take some time."
-
-### FOLDERS
-total_folders=$(jq '.folders | length' "$DEST_OUTPUT_FILE_PATH")
-
-if [ -z "$total_folders" ] || [ "$total_folders" -eq 0 ]; then
-    echo "# No folders found to delete."
-else
-    current_folder=0
-
-    # Loop on folders to remove
-    for id in $(jq -r '.folders[]? | .id' "$DEST_OUTPUT_FILE_PATH"); do
-        current_folder=$((current_folder + 1))
-        echo "# Deleting folder [$current_folder/$total_folders]"
-    
-        # Delete folder
-        bw --session "$DEST_SESSION" --raw delete -p folder "$id"
-    done
-
-    echo "# Folders deleted successfully."
+echo "# Purging destination vault via bw-purge-vault.sh..."
+if ! bash "$SCRIPT_DIR/bw-purge-vault.sh" \
+  --server "$DEST_SERVER" \
+  --api-client-id "$DEST_CLIENT_ID" \
+  --api-client-secret "$DEST_CLIENT_SECRET" \
+  --email "$DEST_ACCOUNT" \
+  --master-password "$DEST_PASSWORD"
+then
+  echo "✕ Error: Failed to purge destination vault." >&2
+  exit 1
 fi
-
-sleep 1
-
-### ITEMS
-total_items=$(jq '.items | length' "$DEST_OUTPUT_FILE_PATH")
-
-if [ -z "$total_items" ] || [ "$total_items" -eq 0 ]; then
-    echo "# No items found to delete."
-else
-    current_item=0
-
-    # Loop on IDs with progress
-    for id in $(jq -r '.items[]? | .id' "$DEST_OUTPUT_FILE_PATH"); do
-        current_item=$((current_item + 1))
-        echo "# Deleting item [$current_item/$total_items]"
-
-        # Remove item
-        bw --session "$DEST_SESSION" --raw delete -p item "$id"
-    done
-
-    echo "# Items deleted successfully."
-fi
-
-sleep 1
-
-### ATTACHMENTS
-total_attach=$(jq '.attachments | length' "$DEST_OUTPUT_FILE_PATH")
-
-if [ -z "$total_attach" ] || [ "$total_attach" -eq 0 ]; then
-    echo "# No attachments found to delete."
-else
-    current_attach=0
-
-    # Loop on IDs with progress
-    for id in $(jq -r '.attachments[]? | .id' "$DEST_OUTPUT_FILE_PATH"); do
-        current_attach=$((current_attach + 1))
-        echo "# Deleting attachment [$current_attach/$total_attach]"
-
-        # Remove attachment
-        bw --session "$DEST_SESSION" --raw delete -p attachment "$id"
-    done
-
-    echo "# Attachments deleted successfully."
-fi
-
-
-echo "# Vault purged successfully."
-echo "# Total removed -> Folders:[${total_folders:-"0"}] - Items:[${total_items:-"0"}] - Attachments:[${total_attach:-"0"}]"
 
 # Remove the unencrypted file
 echo "# Removed unencrypted file"
@@ -436,14 +506,27 @@ sleep 1
 
 # Restoring from source backup (encrypted)
 DEST_LATEST_BACKUP="$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH"
-# Decrypted file stored in temporary folder
-DECRYPTED_SOURCE_OUTPUT_FILE_PATH="$TEMP_FOLDER/$SOURCE_NEW_FILENAME"
+# Decrypted tarball stored in temporary folder
+DECRYPTED_SOURCE_TARBALL="$TEMP_FOLDER/bw_backup_source_$TIMESTAMP.tar.gz"
 
 # Decrypt the latest backup
 echo "# Decrypting the latest backup..."
-decrypt_file "$DEST_LATEST_BACKUP" "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
-fix_permissions "$PUID" "$PGID" "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
+decrypt_file "$DEST_LATEST_BACKUP" "$DECRYPTED_SOURCE_TARBALL" "$ENCRYPTION_PASSWORD"
+fix_permissions "$PUID" "$PGID" "$DECRYPTED_SOURCE_TARBALL"
 
+# Extract the tarball
+echo "# Extracting backup tarball..."
+RESTORE_EXTRACT_DIR="$TEMP_FOLDER/restore_extract"
+mkdir -p "$RESTORE_EXTRACT_DIR"
+tar -xzf "$DECRYPTED_SOURCE_TARBALL" -C "$RESTORE_EXTRACT_DIR"
+
+# Find the JSON export file
+DECRYPTED_SOURCE_OUTPUT_FILE_PATH=$(find "$RESTORE_EXTRACT_DIR" -name "bw_export_source_*.json" | head -n 1)
+
+if [ -z "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" ] || [ ! -f "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" ]; then
+    echo "✕ Error: Could not find JSON export in backup."
+    exit 1
+fi
 
 # Import the decrypted backup
 echo "# Importing the decrypted backup: $DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
@@ -453,9 +536,18 @@ if [ $? -ne 0 ]; then
     exit 1
 fi
 
-# Remove the decrypted file
-rm -f "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
-echo "# Decrypted backup imported and removed."
+echo "# Decrypted backup imported."
+
+# Restore attachments if they exist
+RESTORE_ATTACHMENTS_FOLDER="$RESTORE_EXTRACT_DIR/source"
+if [ -d "$RESTORE_ATTACHMENTS_FOLDER" ]; then
+    restore_attachments "$DEST_SESSION" "$RESTORE_ATTACHMENTS_FOLDER"
+fi
+
+# Remove the decrypted files
+rm -f "$DECRYPTED_SOURCE_TARBALL"
+rm -rf "$RESTORE_EXTRACT_DIR"
+echo "# Cleanup completed."
 
 
 #-------------#
