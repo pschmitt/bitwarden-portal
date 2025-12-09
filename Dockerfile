@@ -44,9 +44,8 @@ RUN echo "$CRON_SCHEDULE root /app/backup.sh > /var/log/cron.log 2>&1" > /etc/cr
 
 # Copy your script and encryption files to the container
 COPY ./bw-purge-vault.sh /app/bw-purge-vault.sh
-COPY ./bw-master-password-hash.sh /app/bw-master-password-hash.sh
 COPY ./bitwarden-portal.sh /app/backup.sh
-COPY ./bw_match_items.py /app/bw_match_items.py
+COPY ./bw.py /app/bw.py
 
 # Copy custom SSL certificates
 COPY ./certs/* /usr/local/share/ca-certificates/
@@ -56,7 +55,7 @@ COPY ./certs/* /usr/share/ca-certificates/
 RUN update-ca-certificates
 
 # Make your script executable
-RUN chmod +x /app/backup.sh
+RUN chmod +x /app/backup.sh /app/bw.py
 
 # Start cron and log output to console
 CMD ["sh", "-c", "echo \"$CRON_SCHEDULE /app/backup.sh > /proc/1/fd/1 2>&1\" > /etc/crontabs/root && crond -f -L /dev/stdout"]

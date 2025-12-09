@@ -503,6 +503,7 @@ sleep 1
 #-----------------#
 
 echo "# Purging destination vault via bw-purge-vault.sh..."
+# Note: bw-purge-vault.sh uses bw.py internally
 if ! bash "$SCRIPT_DIR/bw-purge-vault.sh" \
   --server "$DEST_SERVER" \
   --api-client-id "$DEST_CLIENT_ID" \
@@ -569,7 +570,7 @@ if [ -d "$RESTORE_ATTACHMENTS_FOLDER" ]; then
     # Generate ID mapping
     ID_MAPPING_FILE="$TEMP_FOLDER/id_mapping.tsv"
     echo "# Generating item ID mapping..."
-    python3 "$SCRIPT_DIR/bw_match_items.py" "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" "$DEST_ITEMS_AFTER_IMPORT" > "$ID_MAPPING_FILE"
+    python3 "$SCRIPT_DIR/bw.py" match "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" "$DEST_ITEMS_AFTER_IMPORT" > "$ID_MAPPING_FILE"
 
     restore_attachments "$DEST_SESSION" "$RESTORE_ATTACHMENTS_FOLDER" "$ID_MAPPING_FILE"
 

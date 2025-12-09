@@ -20,12 +20,12 @@ bw_login() {
 }
 
 bw_hash_master_password() {
-  # python3 bw_master_password_hash.py \
+  # python3 bw.py hash \
   #   --email "$BW_EMAIL" \
   #   --password "$BW_MASTER_PASSWORD" \
   #   --kdf-iterations "$KDF_ITERATIONS"
 
-  ./bw-master-password-hash.sh \
+  ./bw.py hash \
     --email "$BW_EMAIL" \
     --password "$BW_MASTER_PASSWORD" \
     --kdf-iterations "$KDF_ITERATIONS"
