@@ -2,9 +2,15 @@
 
 set -euo pipefail
 
+if [ -n "${DEBUG:-}" ]
+then
+  set -x
+fi
+
 MODE="${MODE:-default}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 TIMESTAMP="$(date "+%Y-%m-%d_%H-%M-%S")"
+export BW_NOINTERACTIVE="true"
 
 ENABLE_PRUNING="${ENABLE_PRUNING:-true}"
 MIN_FILES="${MIN_FILES:-5}"
@@ -38,6 +44,23 @@ COLOR_WARN=""
 COLOR_ERROR=""
 COLOR_OK=""
 
+set_bw_env() {
+  local label="$1"
+  local appdata_dir
+  appdata_dir="$TEMP_FOLDER/bw_cli_${label}"
+
+  export BITWARDENCLI_APPDATA_DIR="$appdata_dir"
+  export BW_CONFIG_DIR="$appdata_dir"
+  export XDG_CONFIG_HOME="$appdata_dir"
+  export HOME="$appdata_dir"
+}
+
+set_bw_session_env() {
+  local session="$1"
+  export BW_SESSION="$session"
+  export BW_NOINTERACTIVE="true"
+}
+
 usage() {
   cat <<'EOF'
 Usage: bitwarden-portal.sh [--mode default|backup|sync] [--help]
@@ -61,11 +84,11 @@ setup_colors() {
 }
 
 log_info() {
-  printf "%b# %s%b\n" "$COLOR_INFO" "$1" "$COLOR_RESET"
+  printf "%b# %s%b\n" "$COLOR_INFO" "$1" "$COLOR_RESET" >&2
 }
 
 log_warn() {
-  printf "%b! %s%b\n" "$COLOR_WARN" "$1" "$COLOR_RESET"
+  printf "%b! %s%b\n" "$COLOR_WARN" "$1" "$COLOR_RESET" >&2
 }
 
 log_error() {
@@ -73,11 +96,11 @@ log_error() {
 }
 
 log_ok() {
-  printf "%b✓ %s%b\n" "$COLOR_OK" "$1" "$COLOR_RESET"
+  printf "%b✓ %s%b\n" "$COLOR_OK" "$1" "$COLOR_RESET" >&2
 }
 
 log_section() {
-  printf "%b########## %s ##########%b\n" "$COLOR_INFO" "$1" "$COLOR_RESET"
+  printf "%b########## %s ##########%b\n" "$COLOR_INFO" "$1" "$COLOR_RESET" >&2
 }
 
 parse_args() {
@@ -238,7 +261,10 @@ export_attachments() {
     local att_dest="$dest_folder/$item_id/$att_name"
     if [ ! -e "$att_dest" ]
     then
-      bw --session "$session" get attachment "$att_id" --itemid "$item_id" --output "$att_dest" --raw 2>/dev/null
+      if ! BW_SESSION="$session" BW_NOINTERACTIVE="true" bw --session "$session" get attachment "$att_id" --itemid "$item_id" --output "$att_dest" --raw
+      then
+        echo "Failed to download attachment $att_name for item $item_id" >&2
+      fi
     fi
   done < "$download_list"
 
@@ -246,11 +272,15 @@ export_attachments() {
 }
 
 restore_attachments() {
-  local session="$1"
-  local attachments_folder="$2"
-  local mapping_file="$3"
+  local label="$1"
+  local session="$2"
+  local attachments_folder="$3"
+  local mapping_file="$4"
 
-  if [ ! -d "$attachments_folder" ] || [ -z "$(ls -A "$attachments_folder" 2>/dev/null)" ]
+  set_bw_env "$label"
+  set_bw_session_env "$session"
+
+  if [ ! -d "$attachments_folder" ] || [ -z "$(ls -A "$attachments_folder")" ]
   then
     return 0
   fi
@@ -310,7 +340,7 @@ restore_attachments() {
 
   while IFS=$'\t' read -r item_id att_file
   do
-    bw --session "$session" create attachment --file "$att_file" --itemid "$item_id" 2>/dev/null
+    BW_SESSION="$session" BW_NOINTERACTIVE="true" bw --session "$session" create attachment --file "$att_file" --itemid "$item_id"
   done < "$upload_list"
 
   rm -f "$upload_list"
@@ -374,25 +404,27 @@ bw_login() {
   local client_id="$4"
   local client_secret="$5"
   local password="$6"
-
-  bw logout >/dev/null 2>&1 || true
+  set_bw_env "$label"
+  bw logout >&2 || true
 
   export BW_CLIENTID="$client_id"
   export BW_CLIENTSECRET="$client_secret"
 
   log_info "Configuring $label server: $server"
-  bw config server "$server"
+  bw config server "$server" >&2
 
   log_info "Logging into $label..."
-  if ! bw login "$account" --apikey --raw >/dev/null
+  if ! bw login "$account" --apikey --raw >/tmp/bw_login_output 2>&1
   then
+    cat /tmp/bw_login_output >&2 || true
     log_error "Failed to log in to $label server with account $account at $server."
     exit 1
   fi
+  rm -f /tmp/bw_login_output
 
   log_info "Unlocking the $label vault..."
   local session
-  session=$(bw unlock "$password" --raw)
+  session=$(bw unlock "$password" --raw | awk 'NF {last=$0} END {print last}' | tr -d '\r')
 
   if [ -z "$session" ]
   then
@@ -401,23 +433,35 @@ bw_login() {
   fi
 
   log_info "Synchronizing the $label vault..."
-  bw sync --session "$session" >/dev/null
+  BW_SESSION="$session" BW_NOINTERACTIVE="true" bw sync --session "$session" >&2
 
-  echo "$session"
+  local session_var
+  session_var="$(printf "%s_SESSION" "$(echo "$label" | tr '[:lower:]' '[:upper:]')" )"
+  export "$session_var=$session"
+  export BW_SESSION="$session"
 }
 
 bw_logout() {
   log_info "Locking and logging out..."
-  bw lock >/dev/null 2>&1 || true
-  bw logout >/dev/null 2>&1 || true
+  bw lock >&2 || true
+  bw logout >&2 || true
   unset BW_CLIENTID
   unset BW_CLIENTSECRET
+  unset BW_SESSION
+  unset BITWARDENCLI_APPDATA_DIR
+  unset BW_CONFIG_DIR
+  unset XDG_CONFIG_HOME
+  unset HOME
 }
 
 export_items_with_attachments() {
-  local session="$1"
-  local export_path="$2"
-  local attachments_dir="$3"
+  local label="$1"
+  local session="$2"
+  local export_path="$3"
+  local attachments_dir="$4"
+
+  set_bw_env "$label"
+  set_bw_session_env "$session"
 
   log_info "Exporting all items..."
   bw --session "$session" export --raw --format json > "$export_path"
@@ -445,7 +489,7 @@ create_backup_tarball() {
 
   log_info "Creating backup tarball..."
 
-  if [ -d "$attachments_dir" ] && find "$attachments_dir" -mindepth 1 -print -quit >/dev/null 2>&1
+  if [ -d "$attachments_dir" ] && [ -n "$(find "$attachments_dir" -mindepth 1 -maxdepth 1 | head -n 1)" ]
   then
     tar -czf "$tarball" -C "$TEMP_FOLDER" "$(basename "$export_file")" -C "$ATTACHMENTS_FOLDER" "$(basename "$attachments_dir")"
   else
@@ -460,10 +504,10 @@ backup_source() {
 
   purge_folder "$SOURCE_FOLDER" "$MIN_FILES" "$RETENTION_DAYS"
 
-  local source_session
-  source_session=$(bw_login "source" "$SOURCE_SERVER" "$SOURCE_ACCOUNT" "$SOURCE_CLIENT_ID" "$SOURCE_CLIENT_SECRET" "$SOURCE_PASSWORD")
+  bw_login "source" "$SOURCE_SERVER" "$SOURCE_ACCOUNT" "$SOURCE_CLIENT_ID" "$SOURCE_CLIENT_SECRET" "$SOURCE_PASSWORD"
+  local source_session="$BW_SESSION"
 
-  export_items_with_attachments "$source_session" "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER"
+  export_items_with_attachments "source" "$source_session" "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER"
   create_backup_tarball "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER" "$SOURCE_TARBALL"
   encrypt_file "$SOURCE_TARBALL" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
   fix_permissions "$PUID" "$PGID" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH"
@@ -478,6 +522,8 @@ backup_source() {
 
 backup_destination_vault() {
   local dest_session="$1"
+  set_bw_env "destination"
+  set_bw_session_env "$dest_session"
 
   purge_folder "$DEST_FOLDER" "$MIN_FILES" "$RETENTION_DAYS"
 
@@ -529,6 +575,9 @@ decrypt_backup_payload() {
 import_backup_to_destination() {
   local dest_session="$1"
 
+  set_bw_env "destination"
+  set_bw_session_env "$dest_session"
+
   log_info "Importing the decrypted backup: $DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
   if ! bw --session "$dest_session" --raw import bitwardenjson "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
   then
@@ -549,7 +598,7 @@ import_backup_to_destination() {
     log_info "Generating item ID mapping..."
     python3 "$SCRIPT_DIR/bw.py" match "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" "$dest_items_after_import" > "$id_mapping_file"
 
-    restore_attachments "$dest_session" "$RESTORE_ATTACHMENTS_FOLDER" "$id_mapping_file"
+    restore_attachments "destination" "$dest_session" "$RESTORE_ATTACHMENTS_FOLDER" "$id_mapping_file"
     rm -f "$dest_items_after_import" "$id_mapping_file"
   fi
 
@@ -562,8 +611,8 @@ run_default_mode() {
   backup_source
 
   log_section "Start of Restore process"
-  local dest_session
-  dest_session=$(bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD")
+  bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD"
+  local dest_session="$BW_SESSION"
 
   backup_destination_vault "$dest_session"
   purge_destination_vault
@@ -576,8 +625,8 @@ run_default_mode() {
 
 run_backup_mode() {
   backup_source
-  local dest_session
-  dest_session=$(bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD")
+  bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD"
+  local dest_session="$BW_SESSION"
   backup_destination_vault "$dest_session"
   bw_logout
   log_ok "Backup mode complete."
@@ -588,14 +637,16 @@ run_sync_mode() {
   log_info "Fixing permissions on backups folder..."
   fix_permissions "$PUID" "$PGID" "/app/backups"
 
-  local source_session
-  source_session=$(bw_login "source" "$SOURCE_SERVER" "$SOURCE_ACCOUNT" "$SOURCE_CLIENT_ID" "$SOURCE_CLIENT_SECRET" "$SOURCE_PASSWORD")
-  export_items_with_attachments "$source_session" "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER"
+  bw_login "source" "$SOURCE_SERVER" "$SOURCE_ACCOUNT" "$SOURCE_CLIENT_ID" "$SOURCE_CLIENT_SECRET" "$SOURCE_PASSWORD"
+  local source_session="$BW_SESSION"
+  export_items_with_attachments "source" "$source_session" "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER"
   bw_logout
 
-  local dest_session
-  dest_session=$(bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD")
+  bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD"
+  local dest_session="$BW_SESSION"
   purge_destination_vault
+  set_bw_env "destination"
+  set_bw_session_env "$dest_session"
 
   log_info "Importing source export into destination..."
   if ! bw --session "$dest_session" --raw import bitwardenjson "$SOURCE_EXPORT_FILE_PATH"
@@ -612,12 +663,12 @@ run_sync_mode() {
     id_mapping_file=$(mktemp "$TEMP_FOLDER/id_mapping_XXXX.tsv")
 
     log_info "Exporting destination items to map IDs..."
-    bw --session "$dest_session" list items > "$dest_items_after_import"
+    BW_SESSION="$dest_session" BW_NOINTERACTIVE="true" bw --session "$dest_session" list items > "$dest_items_after_import"
 
     log_info "Generating item ID mapping..."
     python3 "$SCRIPT_DIR/bw.py" match "$SOURCE_EXPORT_FILE_PATH" "$dest_items_after_import" > "$id_mapping_file"
 
-    restore_attachments "$dest_session" "$SOURCE_ATTACHMENTS_FOLDER" "$id_mapping_file"
+    restore_attachments "destination" "$dest_session" "$SOURCE_ATTACHMENTS_FOLDER" "$id_mapping_file"
     rm -f "$dest_items_after_import" "$id_mapping_file"
   fi
 
@@ -634,21 +685,21 @@ main() {
 
   trap cleanup_unencrypted SIGINT SIGTERM EXIT
 
-  log_info "Cleaning up any existing unencrypted backup files..."
-  rm -f "$TEMP_FOLDER"/*.json
-  find "$ATTACHMENTS_FOLDER" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+log_info "Cleaning up any existing unencrypted backup files..."
+rm -f "$TEMP_FOLDER"/*.json
+find "$ATTACHMENTS_FOLDER" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-  case "$MODE" in
-    default)
-      run_default_mode
-      ;;
-    backup)
-      run_backup_mode
-      ;;
-    sync)
-      run_sync_mode
-      ;;
-  esac
+case "$MODE" in
+  default)
+    run_default_mode
+    ;;
+  backup)
+    run_backup_mode
+    ;;
+  sync)
+    run_sync_mode
+    ;;
+esac
 }
 
 main "$@"
