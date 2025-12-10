@@ -1,598 +1,654 @@
-#!/bin/bash
+#!/usr/bin/env bash
 
+set -euo pipefail
+
+MODE="${MODE:-default}"
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+TIMESTAMP="$(date "+%Y-%m-%d_%H-%M-%S")"
 
-TIMESTAMP=$(date "+%Y-%m-%d_%H-%M-%S")
+ENABLE_PRUNING="${ENABLE_PRUNING:-true}"
+MIN_FILES="${MIN_FILES:-5}"
+RETENTION_DAYS="${RETENTION_DAYS:-30}"
+PUID="${PUID:-0}"
+PGID="${PGID:-0}"
 
-#-------------------#
-# Helper Functions  #
-#-------------------#
+SOURCE_FOLDER="/app/backups/source"
+DEST_FOLDER="/app/backups/dest"
+TEMP_FOLDER="/tmp/bitwarden_unencrypted"
+ATTACHMENTS_FOLDER="$TEMP_FOLDER/attachments"
+RESTORE_EXTRACT_DIR="$TEMP_FOLDER/restore_extract"
 
-fix_permissions() {
-    local puid="$1"
-    local pgid="$2"
-    local folder="$3"
+SOURCE_EXPORT_FILENAME="bw_export_source_${TIMESTAMP}.json"
+SOURCE_EXPORT_FILE_PATH="$TEMP_FOLDER/$SOURCE_EXPORT_FILENAME"
+ENCRYPTED_SOURCE_OUTPUT_FILE_PATH="$SOURCE_FOLDER/${SOURCE_EXPORT_FILENAME}.enc"
+SOURCE_TARBALL="$TEMP_FOLDER/bw_backup_source_${TIMESTAMP}.tar.gz"
+DECRYPTED_SOURCE_TARBALL="$TEMP_FOLDER/bw_backup_source_${TIMESTAMP}_decrypted.tar.gz"
+SOURCE_ATTACHMENTS_FOLDER="$ATTACHMENTS_FOLDER/source"
 
-    chown -R "$puid:$pgid" "$folder"
+DEST_EXPORT_FILENAME="bw_export_dest_${TIMESTAMP}.json"
+DEST_OUTPUT_FILE_PATH="$TEMP_FOLDER/$DEST_EXPORT_FILENAME"
+ENCRYPTED_DEST_OUTPUT_FILE_PATH="$DEST_FOLDER/${DEST_EXPORT_FILENAME}.enc"
+
+DECRYPTED_SOURCE_OUTPUT_FILE_PATH=""
+RESTORE_ATTACHMENTS_FOLDER=""
+
+COLOR_RESET=""
+COLOR_INFO=""
+COLOR_WARN=""
+COLOR_ERROR=""
+COLOR_OK=""
+
+usage() {
+  cat <<'EOF'
+Usage: bitwarden-portal.sh [--mode default|backup|sync] [--help]
+
+Modes:
+  default  Backup source + destination and restore source data into destination (previous behavior).
+  backup   Only create backups for source and destination vaults.
+  sync     Synchronize source to destination without creating backups.
+EOF
 }
 
+setup_colors() {
+  if [ -t 1 ]
+  then
+    COLOR_RESET="\033[0m"
+    COLOR_INFO="\033[34m"
+    COLOR_WARN="\033[33m"
+    COLOR_ERROR="\033[31m"
+    COLOR_OK="\033[32m"
+  fi
+}
 
-encrypt_file() {
-    local input_file="$1"
-    local output_file="$2"
-    local password="$3"
+log_info() {
+  printf "%b# %s%b\n" "$COLOR_INFO" "$1" "$COLOR_RESET"
+}
 
-    local input_file_name=$(echo "$input_file" | sed 's/\/app\///g')
-    local output_file_name=$(echo "$output_file" | sed 's/\/app\///g')
+log_warn() {
+  printf "%b! %s%b\n" "$COLOR_WARN" "$1" "$COLOR_RESET"
+}
 
-    echo "# Encrypting file: $input_file_name."
+log_error() {
+  printf "%b✕ %s%b\n" "$COLOR_ERROR" "$1" "$COLOR_RESET" >&2
+}
 
-    openssl enc -aes-256-cbc -salt -pbkdf2 -pass pass:"$password" -in "$input_file" -out "$output_file"
+log_ok() {
+  printf "%b✓ %s%b\n" "$COLOR_OK" "$1" "$COLOR_RESET"
+}
 
-    if [ $? -ne 0 ]; then
-        echo "✕ Error: Failed to encrypt file $input_file."
+log_section() {
+  printf "%b########## %s ##########%b\n" "$COLOR_INFO" "$1" "$COLOR_RESET"
+}
+
+parse_args() {
+  while [ $# -gt 0 ]
+  do
+    case "$1" in
+      --mode)
+        MODE="$2"
+        shift
+        ;;
+      --help|-h)
+        usage
+        exit 0
+        ;;
+      *)
+        log_error "Unknown argument: $1"
+        usage
         exit 1
-    fi
-
-    echo "# Encryption successful: $output_file_name."
+        ;;
+    esac
+    shift
+  done
 }
 
-decrypt_file() {
-    local input_file="$1"
-    local output_file="$2"
-    local password="$3"
-
-    local input_file_name=$(echo "$input_file" | sed 's/\/app\///g')
-    local output_file_name=$(echo "$output_file" | sed 's/\/app\///g')
-
-    echo "# Decrypting file: $input_file_name."
-
-    openssl enc -aes-256-cbc -d -pbkdf2 -pass pass:"$password" -in "$input_file" -out "$output_file"
-
-    if [ $? -ne 0 ]; then
-        echo "✕ Error: Failed to decrypt file $input_file."
-        exit 1
-    fi
-
-    echo "# Decryption successful: $output_file_name."
+validate_mode() {
+  case "$MODE" in
+    default|backup|sync)
+      ;;
+    *)
+      log_error "Invalid mode: $MODE"
+      usage
+      exit 1
+      ;;
+  esac
 }
 
-export_attachments() {
-    local session="$1"
-    local items_json="$2"
-    local dest_folder="$3"
-
-    local items_with_attachments
-    items_with_attachments=$(jq -c '.items[] | select(.attachments != null and (.attachments | length) > 0)' "$items_json")
-
-    if [ -z "$items_with_attachments" ]; then
-        return 0
+ensure_required_vars() {
+  local missing=0
+  for var in SOURCE_SERVER SOURCE_ACCOUNT SOURCE_PASSWORD SOURCE_CLIENT_ID SOURCE_CLIENT_SECRET DEST_SERVER DEST_ACCOUNT DEST_PASSWORD DEST_CLIENT_ID DEST_CLIENT_SECRET
+  do
+    if [ -z "${!var:-}" ]
+    then
+      log_error "Missing environment variable: $var"
+      missing=1
     fi
+  done
 
-    local total_items
-    total_items=$(wc -l <<< "$items_with_attachments")
+  if [ "$MODE" != "sync" ] && [ -z "${ENCRYPTION_PASSWORD:-}" ]
+  then
+    log_error "Missing environment variable: ENCRYPTION_PASSWORD"
+    missing=1
+  fi
 
-    echo "# Exporting attachments from $total_items items..."
-
-    # Create all directories first
-    while IFS= read -r item_data; do
-        local item_id
-        item_id=$(jq -r '.id' <<< "$item_data")
-        mkdir -p "$dest_folder/$item_id"
-    done <<< "$items_with_attachments"
-
-    # Build list of attachments to download with item_id, att_id, att_name
-    local download_list
-    download_list=$(mktemp)
-
-    while IFS= read -r item_data; do
-        local item_id
-        item_id=$(jq -r '.id' <<< "$item_data")
-
-        jq -r --arg item_id "$item_id" '.attachments[] | "\($item_id)\t\(.id)\t\(.fileName)"' <<< "$item_data"
-    done <<< "$items_with_attachments" > "$download_list"
-
-    # Download attachments in parallel
-    cat "$download_list" | xargs -P 200 -I {} bash -c '
-        IFS=$'"'"'\t'"'"' read -r item_id att_id att_name <<< "{}"
-        att_dest="'"$dest_folder"'/$item_id/$att_name"
-        if [ ! -e "$att_dest" ]; then
-            bw --session "'"$session"'" get attachment "$att_id" --itemid "$item_id" --output "$att_dest" --raw 2>/dev/null
-        fi
-    '
-
-    rm -f "$download_list"
+  if [ "$missing" -eq 1 ]
+  then
+    exit 1
+  fi
 }
 
-restore_attachments() {
-    local session="$1"
-    local attachments_folder="$2"
-    local mapping_file="$3"
-
-    if [ ! -d "$attachments_folder" ] || [ -z "$(ls -A "$attachments_folder" 2>/dev/null)" ]; then
-        return 0
-    fi
-
-    local total_items
-    total_items=$(find "$attachments_folder" -mindepth 1 -maxdepth 1 -type d | wc -l)
-
-    if [ "$total_items" -eq 0 ]; then
-        return 0
-    fi
-
-    echo "# Restoring attachments for $total_items items..."
-
-    # Load mapping
-    declare -A id_map
-    if [ -n "$mapping_file" ] && [ -f "$mapping_file" ]; then
-        while IFS=$'\t' read -r src_id dst_id; do
-            id_map["$src_id"]="$dst_id"
-        done < "$mapping_file"
-    fi
-
-    # Build list of attachments to upload: item_id, att_file_path
-    local upload_list
-    upload_list=$(mktemp)
-
-    for item_dir in "$attachments_folder"/*; do
-        if [ ! -d "$item_dir" ]; then
-            continue
-        fi
-
-        local source_item_id
-        source_item_id=$(basename "$item_dir")
-        local dest_item_id="$source_item_id"
-
-        # If mapping exists, use it
-        if [ -n "$mapping_file" ]; then
-            if [ -n "${id_map[$source_item_id]}" ]; then
-                dest_item_id="${id_map[$source_item_id]}"
-            else
-                echo "Warning: Could not find destination item for source item $source_item_id. Skipping attachments."
-                continue
-            fi
-        fi
-
-        for att_file in "$item_dir"/*; do
-            if [ -f "$att_file" ]; then
-                echo "$dest_item_id"$'\t'"$att_file" >> "$upload_list"
-            fi
-        done
-    done
-
-    # Upload attachments in parallel
-    cat "$upload_list" | xargs --verbose -P 10 -I {} bash -c '
-        IFS=$'"'"'\t'"'"' read -r item_id att_file <<< "{}"
-        bw --session "'"$session"'" create attachment --file "$att_file" --itemid "$item_id" 2>/dev/null
-    '
-
-    rm -f "$upload_list"
-}
-
-purge_folder() {
-    local folder_path="$1"
-    local max_files="$2"
-    local retention_days="$3"
-
-    local folder_name=$(echo "$folder_path" | sed 's/\/app\///g')
-
-    if [ "$ENABLE_PRUNING" == "false" ]; then
-        echo "# Pruning disabled, skipping..."
-        return
-    elif [ "$ENABLE_PRUNING" != "true" ]; then
-        echo "The var ENABLE_PRUNING is invalid (only 'true' or 'false' is accepted): $ENABLE_PRUNING"
-        exit 1
-    fi
-
-    echo "# Purging files in folder: $folder_name."
-
-    # Find all files in the folder sorted by modification time (oldest first)
-    all_files=$(find "$folder_path" -type f -printf "%T@ %p\n" | sort -n)
-
-    # Find files older than the retention period
-    old_files=$(find "$folder_path" -type f -mtime +"$retention_days")
-
-    # Find files newer than the retention period
-    recent_files=$(find "$folder_path" -type f -mtime -"$retention_days")
-
-    # Check if there are no files in the folder
-    if [ -z "$all_files" ]; then
-        echo "# No files found in the folder: $folder_path. Nothing to purge."
-        return
-    fi
-
-    # Case 1: If there are recent files, delete only the files older than retention_days
-    if [ -n "$recent_files" ]; then
-        if [ -n "$old_files" ]; then
-            echo "# Found files modified within the last $retention_days days. Deleting only older files..."
-            find "$folder_path" -type f -mtime +"$retention_days" -exec rm -f {} +
-        else
-            echo "# No files older than $retention_days days to delete. Nothing to purge."
-        fi
-    else
-        # Case 2: If all files are older than retention_days, keep only the most recent max_files files
-        echo "# All files are older than $retention_days days. Keeping the most recent $max_files files..."
-        echo "$all_files" | head -n -"$max_files" | awk '{print $2}' | xargs -I{} rm -f "{}"
-    fi
-
-    echo "# Purge completed for $folder_name."
+ensure_directories() {
+  mkdir -p "$SOURCE_FOLDER"
+  mkdir -p "$DEST_FOLDER"
+  mkdir -p "$TEMP_FOLDER"
+  mkdir -p "$ATTACHMENTS_FOLDER"
+  mkdir -p "$RESTORE_EXTRACT_DIR"
 }
 
 cleanup_unencrypted() {
-    echo "# Cleaning up all unencrypted backup files from temporary folder ($TEMP_FOLDER)..."
-    rm -f "$TEMP_FOLDER"/*.json
-    rm -rf "$ATTACHMENTS_FOLDER"
+  log_info "Cleaning up temporary files..."
+  rm -f "$TEMP_FOLDER"/*.json
+  rm -f "$TEMP_FOLDER"/*.tar.gz
+  rm -rf "$ATTACHMENTS_FOLDER"
+  rm -rf "$RESTORE_EXTRACT_DIR"
 }
 
-# Set traps to ensure cleanup is performed on exit or error
-trap cleanup_unencrypted SIGINT SIGTERM EXIT
+fix_permissions() {
+  local puid="$1"
+  local pgid="$2"
+  local folder="$3"
+  chown -R "$puid:$pgid" "$folder"
+}
 
+encrypt_file() {
+  local input_file="$1"
+  local output_file="$2"
+  local password="$3"
 
-#------#
-# INIT #
-#------#
+  local input_file_name="${input_file#/app/}"
+  local output_file_name="${output_file#/app/}"
 
-# Create folder if not exists
-SOURCE_FOLDER="/app/backups/source"
-DEST_FOLDER="/app/backups/dest"
+  log_info "Encrypting file: $input_file_name"
 
-mkdir -p "$SOURCE_FOLDER"
-
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to create folder /backups/source."
+  if ! openssl enc -aes-256-cbc -salt -pbkdf2 -pass "pass:$password" -in "$input_file" -out "$output_file"
+  then
+    log_error "Failed to encrypt file $input_file."
     exit 1
-fi
+  fi
 
-mkdir -p "$DEST_FOLDER"
+  log_ok "Encryption successful: $output_file_name"
+}
 
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to create folder /backups/dest."
+decrypt_file() {
+  local input_file="$1"
+  local output_file="$2"
+  local password="$3"
+
+  local input_file_name="${input_file#/app/}"
+  local output_file_name="${output_file#/app/}"
+
+  log_info "Decrypting file: $input_file_name"
+
+  if ! openssl enc -aes-256-cbc -d -pbkdf2 -pass "pass:$password" -in "$input_file" -out "$output_file"
+  then
+    log_error "Failed to decrypt file $input_file."
     exit 1
-fi
+  fi
 
-# Create temporary folder for unencrypted files
-TEMP_FOLDER="/tmp/bitwarden_unencrypted"
-mkdir -p "$TEMP_FOLDER"
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to create temporary folder $TEMP_FOLDER."
+  log_ok "Decryption successful: $output_file_name"
+}
+
+export_attachments() {
+  local session="$1"
+  local items_json="$2"
+  local dest_folder="$3"
+
+  local items_with_attachments
+  items_with_attachments=$(jq -c '.items[] | select(.attachments != null and (.attachments | length) > 0)' "$items_json")
+
+  if [ -z "$items_with_attachments" ]
+  then
+    return 0
+  fi
+
+  local total_items
+  total_items=$(wc -l <<< "$items_with_attachments")
+
+  log_info "Exporting attachments from $total_items items..."
+
+  while IFS= read -r item_data
+  do
+    local item_id
+    item_id=$(jq -r '.id' <<< "$item_data")
+    mkdir -p "$dest_folder/$item_id"
+  done <<< "$items_with_attachments"
+
+  local download_list
+  download_list=$(mktemp)
+
+  while IFS= read -r item_data
+  do
+    local item_id
+    item_id=$(jq -r '.id' <<< "$item_data")
+    jq -r --arg item_id "$item_id" '.attachments[] | "\($item_id)\t\(.id)\t\(.fileName)"' <<< "$item_data"
+  done <<< "$items_with_attachments" > "$download_list"
+
+  while IFS=$'\t' read -r item_id att_id att_name
+  do
+    local att_dest="$dest_folder/$item_id/$att_name"
+    if [ ! -e "$att_dest" ]
+    then
+      bw --session "$session" get attachment "$att_id" --itemid "$item_id" --output "$att_dest" --raw 2>/dev/null
+    fi
+  done < "$download_list"
+
+  rm -f "$download_list"
+}
+
+restore_attachments() {
+  local session="$1"
+  local attachments_folder="$2"
+  local mapping_file="$3"
+
+  if [ ! -d "$attachments_folder" ] || [ -z "$(ls -A "$attachments_folder" 2>/dev/null)" ]
+  then
+    return 0
+  fi
+
+  local total_items
+  total_items=$(find "$attachments_folder" -mindepth 1 -maxdepth 1 -type d | wc -l)
+
+  if [ "$total_items" -eq 0 ]
+  then
+    return 0
+  fi
+
+  log_info "Restoring attachments for $total_items items..."
+
+  declare -A id_map
+  if [ -n "$mapping_file" ] && [ -f "$mapping_file" ]
+  then
+    while IFS=$'\t' read -r src_id dst_id
+    do
+      id_map["$src_id"]="$dst_id"
+    done < "$mapping_file"
+  fi
+
+  local upload_list
+  upload_list=$(mktemp)
+
+  for item_dir in "$attachments_folder"/*
+  do
+    if [ ! -d "$item_dir" ]
+    then
+      continue
+    fi
+
+    local source_item_id
+    source_item_id=$(basename "$item_dir")
+    local dest_item_id="$source_item_id"
+
+    if [ -n "$mapping_file" ]
+    then
+      if [ -n "${id_map[$source_item_id]:-}" ]
+      then
+        dest_item_id="${id_map[$source_item_id]}"
+      else
+        log_warn "Could not find destination item for source item $source_item_id. Skipping attachments."
+        continue
+      fi
+    fi
+
+    for att_file in "$item_dir"/*
+    do
+      if [ -f "$att_file" ]
+      then
+        printf "%s\t%s\n" "$dest_item_id" "$att_file" >> "$upload_list"
+      fi
+    done
+  done
+
+  while IFS=$'\t' read -r item_id att_file
+  do
+    bw --session "$session" create attachment --file "$att_file" --itemid "$item_id" 2>/dev/null
+  done < "$upload_list"
+
+  rm -f "$upload_list"
+}
+
+purge_folder() {
+  local folder_path="$1"
+  local max_files="$2"
+  local retention_days="$3"
+
+  local folder_name="${folder_path#/app/}"
+
+  if [ "$ENABLE_PRUNING" = "false" ]
+  then
+    log_info "Pruning disabled, skipping for $folder_name."
+    return
+  elif [ "$ENABLE_PRUNING" != "true" ]
+  then
+    log_error "ENABLE_PRUNING must be 'true' or 'false': $ENABLE_PRUNING"
     exit 1
-fi
+  fi
 
-# Create temporary folder for attachments
-ATTACHMENTS_FOLDER="$TEMP_FOLDER/attachments"
-mkdir -p "$ATTACHMENTS_FOLDER"
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to create attachments folder $ATTACHMENTS_FOLDER."
+  log_info "Purging files in folder: $folder_name"
+
+  local all_files
+  all_files=$(find "$folder_path" -type f -printf "%T@ %p\n" | sort -n)
+
+  local old_files
+  old_files=$(find "$folder_path" -type f -mtime +"$retention_days")
+
+  local recent_files
+  recent_files=$(find "$folder_path" -type f -mtime -"$retention_days")
+
+  if [ -z "$all_files" ]
+  then
+    log_info "No files found in folder: $folder_path. Nothing to purge."
+    return
+  fi
+
+  if [ -n "$recent_files" ]
+  then
+    if [ -n "$old_files" ]
+    then
+      log_info "Deleting files older than $retention_days days..."
+      find "$folder_path" -type f -mtime +"$retention_days" -exec rm -f {} +
+    else
+      log_info "No files older than $retention_days days to delete."
+    fi
+  else
+    log_info "All files are older than $retention_days days. Keeping the most recent $max_files files..."
+    echo "$all_files" | head -n -"$max_files" | awk '{print $2}' | xargs -I{} rm -f "{}"
+  fi
+
+  log_ok "Purge completed for $folder_name."
+}
+
+bw_login() {
+  local label="$1"
+  local server="$2"
+  local account="$3"
+  local client_id="$4"
+  local client_secret="$5"
+  local password="$6"
+
+  bw logout >/dev/null 2>&1 || true
+
+  export BW_CLIENTID="$client_id"
+  export BW_CLIENTSECRET="$client_secret"
+
+  log_info "Configuring $label server: $server"
+  bw config server "$server"
+
+  log_info "Logging into $label..."
+  if ! bw login "$account" --apikey --raw >/dev/null
+  then
+    log_error "Failed to log in to $label server with account $account at $server."
     exit 1
-fi
+  fi
 
-# Clean up any existing unencrypted backup files from TEMP_FOLDER
-echo "# Cleaning up any existing unencrypted backup files..."
-rm -f "$TEMP_FOLDER"/*.json
-rm -rf "$ATTACHMENTS_FOLDER"/*
+  log_info "Unlocking the $label vault..."
+  local session
+  session=$(bw unlock "$password" --raw)
 
-echo "########## Start of Backup process ##########"
-
-echo "# Fixing permissions on backups folder..."
-fix_permissions "$PUID" "$PGID" "/app/backups"
-
-sleep 1
-
-
-#--------#
-# BACKUP #
-#--------#
-
-echo "# Start Time: $(date)"
-
-# Set the filename for our json export as variable
-SOURCE_EXPORT_OUTPUT_BASE="bw_export_source_"
-SOURCE_NEW_FILENAME="$SOURCE_EXPORT_OUTPUT_BASE$TIMESTAMP.json"
-# Unencrypted file stored in temporary folder
-SOURCE_OUTPUT_FILE_PATH="$TEMP_FOLDER/$SOURCE_NEW_FILENAME"
-# Encrypted file stored in source backup folder
-ENCRYPTED_SOURCE_OUTPUT_FILE_PATH="$SOURCE_FOLDER/$SOURCE_NEW_FILENAME.enc"
-
-
-#--------------#
-# SOURCE PURGE #
-#--------------#
-
-purge_folder "$SOURCE_FOLDER" "$MIN_FILES" "$RETENTION_DAYS"
-sleep 1
-
-
-#--------------#
-# SOURCE LOGIN #
-#--------------#
-
-# Lets make sure we're logged out before we start
-echo "# Logging out from Bitwarden..."
-bw logout >/dev/null
-
-export BW_CLIENTID=${SOURCE_CLIENT_ID}
-export BW_CLIENTSECRET=${SOURCE_CLIENT_SECRET}
-
-# Login to our Server
-echo "# Logging into Source server..."
-bw config server "$SOURCE_SERVER"
-
-bw login "$SOURCE_ACCOUNT" --apikey --raw
-
-if [ $? -ne 0 ]; then
-    printf "\n"
-    echo "✕ Error: Failed to log in to source server with account ${SOURCE_ACCOUNT} at ${SOURCE_SERVER}."
+  if [ -z "$session" ]
+  then
+    log_error "No $label session retrieved. Check your credentials."
     exit 1
-fi
+  fi
 
-printf '\n'
+  log_info "Synchronizing the $label vault..."
+  bw sync --session "$session" >/dev/null
 
-# By using an API Key, we need to unlock the vault to get a sessionID
-echo "# Unlocking the vault..."
-SOURCE_SESSION=$(bw unlock "$SOURCE_PASSWORD" --raw)
+  echo "$session"
+}
 
-if [ -z "$SOURCE_SESSION" ]; then
-    echo "✕ Error: No source session retrieved. Check your source credentials and try again."
+bw_logout() {
+  log_info "Locking and logging out..."
+  bw lock >/dev/null 2>&1 || true
+  bw logout >/dev/null 2>&1 || true
+  unset BW_CLIENTID
+  unset BW_CLIENTSECRET
+}
+
+export_items_with_attachments() {
+  local session="$1"
+  local export_path="$2"
+  local attachments_dir="$3"
+
+  log_info "Exporting all items..."
+  bw --session "$session" export --raw --format json > "$export_path"
+  fix_permissions "$PUID" "$PGID" "$export_path"
+
+  local items_list
+  items_list=$(mktemp "$TEMP_FOLDER/items_list_XXXX.json")
+  local items_wrapped
+  items_wrapped=$(mktemp "$TEMP_FOLDER/items_wrapped_XXXX.json")
+
+  log_info "Exporting item list (for attachment metadata)..."
+  bw --session "$session" list items > "$items_list"
+  jq '{items: .}' "$items_list" > "$items_wrapped"
+
+  mkdir -p "$attachments_dir"
+  export_attachments "$session" "$items_wrapped" "$attachments_dir"
+
+  rm -f "$items_list" "$items_wrapped"
+}
+
+create_backup_tarball() {
+  local export_file="$1"
+  local attachments_dir="$2"
+  local tarball="$3"
+
+  log_info "Creating backup tarball..."
+
+  if [ -d "$attachments_dir" ] && find "$attachments_dir" -mindepth 1 -print -quit >/dev/null 2>&1
+  then
+    tar -czf "$tarball" -C "$TEMP_FOLDER" "$(basename "$export_file")" -C "$ATTACHMENTS_FOLDER" "$(basename "$attachments_dir")"
+  else
+    tar -czf "$tarball" -C "$TEMP_FOLDER" "$(basename "$export_file")"
+  fi
+}
+
+backup_source() {
+  log_section "Start of Backup process"
+  log_info "Fixing permissions on backups folder..."
+  fix_permissions "$PUID" "$PGID" "/app/backups"
+
+  purge_folder "$SOURCE_FOLDER" "$MIN_FILES" "$RETENTION_DAYS"
+
+  local source_session
+  source_session=$(bw_login "source" "$SOURCE_SERVER" "$SOURCE_ACCOUNT" "$SOURCE_CLIENT_ID" "$SOURCE_CLIENT_SECRET" "$SOURCE_PASSWORD")
+
+  export_items_with_attachments "$source_session" "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER"
+  create_backup_tarball "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER" "$SOURCE_TARBALL"
+  encrypt_file "$SOURCE_TARBALL" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
+  fix_permissions "$PUID" "$PGID" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH"
+
+  log_info "Cleaning source unencrypted export and tarball."
+  rm -f "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_TARBALL"
+  rm -rf "$SOURCE_ATTACHMENTS_FOLDER"
+
+  bw_logout
+  log_section "End of Backup process"
+}
+
+backup_destination_vault() {
+  local dest_session="$1"
+
+  purge_folder "$DEST_FOLDER" "$MIN_FILES" "$RETENTION_DAYS"
+
+  log_info "Exporting current items from destination vault..."
+  bw --session "$dest_session" export --raw --format json > "$DEST_OUTPUT_FILE_PATH"
+  fix_permissions "$PUID" "$PGID" "$DEST_OUTPUT_FILE_PATH"
+
+  log_info "Encrypting exported destination file..."
+  encrypt_file "$DEST_OUTPUT_FILE_PATH" "$ENCRYPTED_DEST_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
+  fix_permissions "$PUID" "$PGID" "$ENCRYPTED_DEST_OUTPUT_FILE_PATH"
+
+  log_info "Removing unencrypted destination export."
+  rm -f "$DEST_OUTPUT_FILE_PATH"
+}
+
+purge_destination_vault() {
+  log_info "Purging destination vault via bw-purge-vault.sh..."
+  if ! bash "$SCRIPT_DIR/bw-purge-vault.sh" \
+    --server "$DEST_SERVER" \
+    --api-client-id "$DEST_CLIENT_ID" \
+    --api-client-secret "$DEST_CLIENT_SECRET" \
+    --email "$DEST_ACCOUNT" \
+    --master-password "$DEST_PASSWORD"
+  then
+    log_error "Failed to purge destination vault."
     exit 1
-fi
+  fi
+}
 
-# Synchronizing the vault
-echo "# Synchronizing the vault..."
-bw sync --session "$SOURCE_SESSION"
-printf '\n'
+decrypt_backup_payload() {
+  log_info "Decrypting the latest backup..."
+  decrypt_file "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH" "$DECRYPTED_SOURCE_TARBALL" "$ENCRYPTION_PASSWORD"
+  fix_permissions "$PUID" "$PGID" "$DECRYPTED_SOURCE_TARBALL"
 
+  log_info "Extracting backup tarball..."
+  mkdir -p "$RESTORE_EXTRACT_DIR"
+  tar -xzf "$DECRYPTED_SOURCE_TARBALL" -C "$RESTORE_EXTRACT_DIR"
 
-#---------------#
-# SOURCE EXPORT #
-#---------------#
+  DECRYPTED_SOURCE_OUTPUT_FILE_PATH=$(find "$RESTORE_EXTRACT_DIR" -name "bw_export_source_*.json" | head -n 1)
+  RESTORE_ATTACHMENTS_FOLDER="$RESTORE_EXTRACT_DIR/source"
 
-echo "# Exporting all items..."
-bw --session "$SOURCE_SESSION" export --raw --format json > "$SOURCE_OUTPUT_FILE_PATH"
-
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to export data."
+  if [ -z "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" ] || [ ! -f "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" ]
+  then
+    log_error "Could not find JSON export in backup."
     exit 1
-fi
+  fi
+}
 
-fix_permissions "$PUID" "$PGID" "$SOURCE_OUTPUT_FILE_PATH"
+import_backup_to_destination() {
+  local dest_session="$1"
 
-# Export list of items with attachment metadata
-SOURCE_ITEMS_LIST="$TEMP_FOLDER/bw_items_source_$TIMESTAMP.json"
-echo "# Exporting item list (for attachment metadata)..."
-bw --session "$SOURCE_SESSION" list items > "$SOURCE_ITEMS_LIST"
-
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to list items."
+  log_info "Importing the decrypted backup: $DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
+  if ! bw --session "$dest_session" --raw import bitwardenjson "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
+  then
+    log_error "Failed to import data."
     exit 1
-fi
+  fi
 
-# Wrap items list in export format for export_attachments function
-SOURCE_ITEMS_WRAPPED="$TEMP_FOLDER/bw_items_wrapped_$TIMESTAMP.json"
-jq '{items: .}' "$SOURCE_ITEMS_LIST" > "$SOURCE_ITEMS_WRAPPED"
+  if [ -d "$RESTORE_ATTACHMENTS_FOLDER" ]
+  then
+    local dest_items_after_import
+    dest_items_after_import=$(mktemp "$TEMP_FOLDER/dest_items_after_import_XXXX.json")
+    local id_mapping_file
+    id_mapping_file=$(mktemp "$TEMP_FOLDER/id_mapping_XXXX.tsv")
 
-# Export attachments
-SOURCE_ATTACHMENTS_FOLDER="$ATTACHMENTS_FOLDER/source"
-mkdir -p "$SOURCE_ATTACHMENTS_FOLDER"
-export_attachments "$SOURCE_SESSION" "$SOURCE_ITEMS_WRAPPED" "$SOURCE_ATTACHMENTS_FOLDER"
+    log_info "Exporting destination items to map IDs..."
+    bw --session "$dest_session" list items > "$dest_items_after_import"
 
-#-----------------------#
-# SOURCE EXPORT ENCRYPT #
-#-----------------------#
+    log_info "Generating item ID mapping..."
+    python3 "$SCRIPT_DIR/bw.py" match "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" "$dest_items_after_import" > "$id_mapping_file"
 
-# Create tarball with export and attachments
-SOURCE_TARBALL="$TEMP_FOLDER/bw_backup_source_$TIMESTAMP.tar.gz"
-echo "# Creating backup tarball with attachments..."
-tar -czf "$SOURCE_TARBALL" -C "$TEMP_FOLDER" "$(basename "$SOURCE_OUTPUT_FILE_PATH")" -C "$ATTACHMENTS_FOLDER" source 2>/dev/null || tar -czf "$SOURCE_TARBALL" -C "$TEMP_FOLDER" "$(basename "$SOURCE_OUTPUT_FILE_PATH")"
+    restore_attachments "$dest_session" "$RESTORE_ATTACHMENTS_FOLDER" "$id_mapping_file"
+    rm -f "$dest_items_after_import" "$id_mapping_file"
+  fi
 
-# Encrypt the tarball
-encrypt_file "$SOURCE_TARBALL" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
-fix_permissions "$PUID" "$PGID" "$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH"
+  rm -f "$DECRYPTED_SOURCE_TARBALL"
+  rm -rf "$RESTORE_EXTRACT_DIR"
+  log_ok "Destination import complete."
+}
 
-# Remove the unencrypted files
-echo "# Removed unencrypted files."
-rm -f "$SOURCE_OUTPUT_FILE_PATH" "$SOURCE_ITEMS_LIST" "$SOURCE_ITEMS_WRAPPED" "$SOURCE_TARBALL"
-rm -rf "$SOURCE_ATTACHMENTS_FOLDER"
+run_default_mode() {
+  backup_source
 
-sleep 1
+  log_section "Start of Restore process"
+  local dest_session
+  dest_session=$(bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD")
 
-#---------------#
-# SOURCE LOGOUT #
-#---------------#
-echo "# Locking the vault..."
-bw lock
-echo ""
+  backup_destination_vault "$dest_session"
+  purge_destination_vault
+  decrypt_backup_payload
+  import_backup_to_destination "$dest_session"
 
-# Logout
-echo "# Logging out from Bitwarden..."
-bw logout >/dev/null
+  bw_logout
+  log_section "End of Restore Process"
+}
 
-unset BW_CLIENTID
-unset BW_CLIENTSECRET
+run_backup_mode() {
+  backup_source
+  local dest_session
+  dest_session=$(bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD")
+  backup_destination_vault "$dest_session"
+  bw_logout
+  log_ok "Backup mode complete."
+}
 
-echo "########## End of Backup process ##########"
+run_sync_mode() {
+  log_section "Start of Sync process"
+  log_info "Fixing permissions on backups folder..."
+  fix_permissions "$PUID" "$PGID" "/app/backups"
 
-sleep 1
+  local source_session
+  source_session=$(bw_login "source" "$SOURCE_SERVER" "$SOURCE_ACCOUNT" "$SOURCE_CLIENT_ID" "$SOURCE_CLIENT_SECRET" "$SOURCE_PASSWORD")
+  export_items_with_attachments "$source_session" "$SOURCE_EXPORT_FILE_PATH" "$SOURCE_ATTACHMENTS_FOLDER"
+  bw_logout
 
+  local dest_session
+  dest_session=$(bw_login "destination" "$DEST_SERVER" "$DEST_ACCOUNT" "$DEST_CLIENT_ID" "$DEST_CLIENT_SECRET" "$DEST_PASSWORD")
+  purge_destination_vault
 
-#---------#
-# RESTORE #
-#---------#
-
-# Restoring process
-echo "########## Start of Restore process ##########"
-
-# We want to remove items later, so we set a base filename now
-DEST_EXPORT_OUTPUT_BASE="bw_export_dest_"
-DEST_NEW_FILENAME="$DEST_EXPORT_OUTPUT_BASE$TIMESTAMP.json"
-# Unencrypted file stored in temporary folder
-DEST_OUTPUT_FILE_PATH="$TEMP_FOLDER/$DEST_NEW_FILENAME"
-# Encrypted file stored in destination backup folder
-ENCRYPTED_DEST_OUTPUT_FILE_PATH="$DEST_FOLDER/$DEST_NEW_FILENAME.enc"
-
-
-#------------#
-# DEST PURGE #
-#------------#
-
-purge_folder "$DEST_FOLDER" "$MIN_FILES" "$RETENTION_DAYS"
-sleep 1
-
-#------------#
-# DEST LOGIN #
-#------------#
-
-export BW_CLIENTID=${DEST_CLIENT_ID}
-export BW_CLIENTSECRET=${DEST_CLIENT_SECRET}
-
-# Login to our Server
-echo "# Logging into Dest server..."
-bw config server "$DEST_SERVER"
-
-bw login "$DEST_ACCOUNT" --apikey --raw
-
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to log in to destination server with account ${DEST_ACCOUNT} at ${DEST_SERVER}."
+  log_info "Importing source export into destination..."
+  if ! bw --session "$dest_session" --raw import bitwardenjson "$SOURCE_EXPORT_FILE_PATH"
+  then
+    log_error "Failed to import data."
     exit 1
-fi
+  fi
 
-printf '\n'
+  if [ -d "$SOURCE_ATTACHMENTS_FOLDER" ]
+  then
+    local dest_items_after_import
+    dest_items_after_import=$(mktemp "$TEMP_FOLDER/dest_items_after_import_XXXX.json")
+    local id_mapping_file
+    id_mapping_file=$(mktemp "$TEMP_FOLDER/id_mapping_XXXX.tsv")
 
-# By using an API Key, we need to unlock the vault to get a sessionID
-echo "# Unlocking the vault..."
-DEST_SESSION=$(bw unlock "$DEST_PASSWORD" --raw)
+    log_info "Exporting destination items to map IDs..."
+    bw --session "$dest_session" list items > "$dest_items_after_import"
 
-if [ -z "$DEST_SESSION" ]; then
-    echo "✕ Error: No destination session retrieved. Check your destination credentials and try again."
-    exit 1
-fi
+    log_info "Generating item ID mapping..."
+    python3 "$SCRIPT_DIR/bw.py" match "$SOURCE_EXPORT_FILE_PATH" "$dest_items_after_import" > "$id_mapping_file"
 
-# Synchronizing the vault
-echo "# Synchronizing the vault..."
-bw sync --session "$DEST_SESSION"
-printf '\n'
+    restore_attachments "$dest_session" "$SOURCE_ATTACHMENTS_FOLDER" "$id_mapping_file"
+    rm -f "$dest_items_after_import" "$id_mapping_file"
+  fi
 
+  bw_logout
+  log_section "End of Sync process"
+}
 
-#-------------#
-# DEST EXPORT #
-#-------------#
+main() {
+  setup_colors
+  parse_args "$@"
+  validate_mode
+  ensure_required_vars
+  ensure_directories
 
-# Export what's currently in the vault, so we can remove it
-echo "# Exporting current items from destination vault..."
-bw --session "$DEST_SESSION" export --raw --format json > "$DEST_OUTPUT_FILE_PATH"
+  trap cleanup_unencrypted SIGINT SIGTERM EXIT
 
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to export data."
-    exit 1
-fi
+  log_info "Cleaning up any existing unencrypted backup files..."
+  rm -f "$TEMP_FOLDER"/*.json
+  find "$ATTACHMENTS_FOLDER" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
 
-fix_permissions "$PUID" "$PGID" "$DEST_OUTPUT_FILE_PATH"
+  case "$MODE" in
+    default)
+      run_default_mode
+      ;;
+    backup)
+      run_backup_mode
+      ;;
+    sync)
+      run_sync_mode
+      ;;
+  esac
+}
 
-#---------------------#
-# DEST EXPORT ENCRYPT #
-#---------------------#
-
-# Encrypt the exported file
-echo "# Encrypting exported file..."
-encrypt_file "$DEST_OUTPUT_FILE_PATH" "$ENCRYPTED_DEST_OUTPUT_FILE_PATH" "$ENCRYPTION_PASSWORD"
-fix_permissions "$PUID" "$PGID" "$ENCRYPTED_DEST_OUTPUT_FILE_PATH"
-
-sleep 1
-
-#-----------------#
-# DEST REMOVE OLD #
-#-----------------#
-
-echo "# Purging destination vault via bw-purge-vault.sh..."
-# Note: bw-purge-vault.sh uses bw.py internally
-if ! bash "$SCRIPT_DIR/bw-purge-vault.sh" \
-  --server "$DEST_SERVER" \
-  --api-client-id "$DEST_CLIENT_ID" \
-  --api-client-secret "$DEST_CLIENT_SECRET" \
-  --email "$DEST_ACCOUNT" \
-  --master-password "$DEST_PASSWORD"
-then
-  echo "✕ Error: Failed to purge destination vault." >&2
-  exit 1
-fi
-
-# Remove the unencrypted file
-echo "# Removed unencrypted file"
-rm -f "$DEST_OUTPUT_FILE_PATH"
-
-sleep 1
-
-#---------------------------#
-# DEST IMPORT SOURCE BACKUP #
-#---------------------------#
-
-# Restoring from source backup (encrypted)
-DEST_LATEST_BACKUP="$ENCRYPTED_SOURCE_OUTPUT_FILE_PATH"
-# Decrypted tarball stored in temporary folder
-DECRYPTED_SOURCE_TARBALL="$TEMP_FOLDER/bw_backup_source_$TIMESTAMP.tar.gz"
-
-# Decrypt the latest backup
-echo "# Decrypting the latest backup..."
-decrypt_file "$DEST_LATEST_BACKUP" "$DECRYPTED_SOURCE_TARBALL" "$ENCRYPTION_PASSWORD"
-fix_permissions "$PUID" "$PGID" "$DECRYPTED_SOURCE_TARBALL"
-
-# Extract the tarball
-echo "# Extracting backup tarball..."
-RESTORE_EXTRACT_DIR="$TEMP_FOLDER/restore_extract"
-mkdir -p "$RESTORE_EXTRACT_DIR"
-tar -xzf "$DECRYPTED_SOURCE_TARBALL" -C "$RESTORE_EXTRACT_DIR"
-
-# Find the JSON export file
-DECRYPTED_SOURCE_OUTPUT_FILE_PATH=$(find "$RESTORE_EXTRACT_DIR" -name "bw_export_source_*.json" | head -n 1)
-
-if [ -z "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" ] || [ ! -f "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" ]; then
-    echo "✕ Error: Could not find JSON export in backup."
-    exit 1
-fi
-
-# Import the decrypted backup
-echo "# Importing the decrypted backup: $DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
-bw --session "$DEST_SESSION" --raw import bitwardenjson "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH"
-if [ $? -ne 0 ]; then
-    echo "✕ Error: Failed to import data."
-    exit 1
-fi
-
-echo "# Decrypted backup imported."
-
-# Restore attachments if they exist
-RESTORE_ATTACHMENTS_FOLDER="$RESTORE_EXTRACT_DIR/source"
-if [ -d "$RESTORE_ATTACHMENTS_FOLDER" ]; then
-    # Export destination items to get new IDs
-    DEST_ITEMS_AFTER_IMPORT="$TEMP_FOLDER/dest_items_after_import.json"
-    echo "# Exporting destination items to map IDs..."
-    bw --session "$DEST_SESSION" list items > "$DEST_ITEMS_AFTER_IMPORT"
-
-    # Generate ID mapping
-    ID_MAPPING_FILE="$TEMP_FOLDER/id_mapping.tsv"
-    echo "# Generating item ID mapping..."
-    python3 "$SCRIPT_DIR/bw.py" match "$DECRYPTED_SOURCE_OUTPUT_FILE_PATH" "$DEST_ITEMS_AFTER_IMPORT" > "$ID_MAPPING_FILE"
-
-    restore_attachments "$DEST_SESSION" "$RESTORE_ATTACHMENTS_FOLDER" "$ID_MAPPING_FILE"
-
-    rm -f "$DEST_ITEMS_AFTER_IMPORT" "$ID_MAPPING_FILE"
-fi
-
-# Remove the decrypted files
-rm -f "$DECRYPTED_SOURCE_TARBALL"
-rm -rf "$RESTORE_EXTRACT_DIR"
-echo "# Cleanup completed."
-
-
-#-------------#
-# DEST LOGOUT #
-#-------------#
-
-echo "# Locking the vault and logout from destination server..."
-bw lock > /dev/null
-
-bw logout > /dev/null
-
-echo "########## End of Restore Process ##########"
-
-unset BW_CLIENTID
-unset BW_CLIENTSECRET
+main "$@"
