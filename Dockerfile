@@ -1,61 +1,39 @@
-# Use a Node.js base image
+# syntax=docker/dockerfile:1
 FROM node:25-alpine
 
-ENV TZ="Europe/Berlin"
-RUN apk --no-cache add tzdata
+ENV TZ="Europe/Berlin" \
+    CRON_SCHEDULE="0 0 * * *"
 
-# Set working directory
 WORKDIR /app
 
-# Install required packages
+# hadolint ignore=DL3018
 RUN apk --no-cache add \
-  python3 \
-  curl \
-  bash \
-  ca-certificates \
-  openssl \
-  ncurses \
-  coreutils \
-  make \
-  gcc \
-  g++ \
-  libgcc \
-  linux-headers \
-  grep \
-  util-linux \
-  binutils \
-  findutils \
-  uuidgen \
-  wget \
-  unzip \
-  tar \
-  openssl \
-  jq \
-  bash
+    tzdata \
+    ca-certificates
 
-# Install Bitwarden CLI
+# hadolint ignore=DL3018
+RUN apk --no-cache add \
+    bash \
+    coreutils \
+    curl \
+    findutils \
+    jq \
+    openssl \
+    python3 \
+    tar \
+    util-linux
+
+# hadolint ignore=DL3016
 RUN npm install -g @bitwarden/cli
 
-# Define a default cron schedule
-ENV CRON_SCHEDULE="0 0 * * *"
+COPY bitwarden-portal.sh /app/backup.sh
+COPY bw.py /app/bw.py
+COPY certs/ /usr/local/share/ca-certificates/
+COPY certs/ /usr/share/ca-certificates/
 
-# Create a cron job file with the defined schedule
-RUN echo "$CRON_SCHEDULE root /app/backup.sh > /var/log/cron.log 2>&1" > /etc/crontabs/root
-
-# Copy your script and encryption files to the container
-COPY ./bw-purge-vault.sh /app/bw-purge-vault.sh
-COPY ./bitwarden-portal.sh /app/backup.sh
-COPY ./bw.py /app/bw.py
-
-# Copy custom SSL certificates
-COPY ./certs/* /usr/local/share/ca-certificates/
-COPY ./certs/* /usr/share/ca-certificates/
-
-# Update SSL certificates
 RUN update-ca-certificates
 
-# Make your script executable
 RUN chmod +x /app/backup.sh /app/bw.py
 
-# Start cron and log output to console
+# hadolint ignore=DL3002
 CMD ["sh", "-c", "echo \"$CRON_SCHEDULE /app/backup.sh > /proc/1/fd/1 2>&1\" > /etc/crontabs/root && crond -f -L /dev/stdout"]
