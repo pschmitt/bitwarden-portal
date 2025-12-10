@@ -494,8 +494,8 @@ backup_destination_vault() {
 }
 
 purge_destination_vault() {
-  log_info "Purging destination vault via bw-purge-vault.sh..."
-  if ! bash "$SCRIPT_DIR/bw-purge-vault.sh" \
+  log_info "Purging destination vault via bw.py..."
+  if ! python3 "$SCRIPT_DIR/bw.py" purge \
     --server "$DEST_SERVER" \
     --api-client-id "$DEST_CLIENT_ID" \
     --api-client-secret "$DEST_CLIENT_SECRET" \

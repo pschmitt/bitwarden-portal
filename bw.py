@@ -2,10 +2,13 @@
 
 import argparse
 import base64
+import difflib
 import hashlib
 import json
 import sys
-import difflib
+import urllib.parse
+import urllib.request
+import uuid
 
 # -----------------------------------------------------------------------------
 # Master Password Hash Logic
@@ -35,6 +38,14 @@ def compute_master_password_auth_hash(
         dklen=dklen,
     )
     return base64.b64encode(out).decode("ascii")
+
+
+def safe_json_load(response_body: bytes, context: str):
+    try:
+        return json.loads(response_body.decode("utf-8"))
+    except Exception as exc:
+        sys.stderr.write(f"Failed to parse JSON from {context}: {exc}\n")
+        sys.exit(1)
 
 
 def action_hash(args):
@@ -220,9 +231,97 @@ def action_match(args):
                                     tofile=f"Dest {cand['id']}",
                                     lineterm="",
                                 )
-                                for line in diff:
-                                    sys.stderr.write(f"DIFF: {line}\n")
-                        debug_count += 1
+                        for line in diff:
+                            sys.stderr.write(f"DIFF: {line}\n")
+                    debug_count += 1
+
+
+# -----------------------------------------------------------------------------
+# Purge Vault Logic
+# -----------------------------------------------------------------------------
+
+
+def ensure_server_url(server: str) -> str:
+    return server.rstrip("/")
+
+
+def http_post_form(url: str, data: dict) -> dict:
+    encoded = urllib.parse.urlencode(data).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=encoded,
+        headers={"Content-Type": "application/x-www-form-urlencoded"},
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            body = resp.read()
+    except Exception as exc:
+        sys.stderr.write(f"Failed HTTP POST form to {url}: {exc}\n")
+        sys.exit(1)
+    return safe_json_load(body, url)
+
+
+def http_post_json(url: str, data: dict, bearer_token: str) -> dict:
+    encoded = json.dumps(data).encode("utf-8")
+    request = urllib.request.Request(
+        url,
+        data=encoded,
+        headers={
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {bearer_token}",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as resp:
+            body = resp.read()
+    except Exception as exc:
+        sys.stderr.write(f"Failed HTTP POST json to {url}: {exc}\n")
+        sys.exit(1)
+    if not body:
+        return {}
+    return safe_json_load(body, url)
+
+
+def action_purge(args):
+    server = ensure_server_url(args.server)
+    device_identifier = str(uuid.uuid4())
+
+    login_payload = {
+        "grant_type": "client_credentials",
+        "client_id": args.api_client_id,
+        "client_secret": args.api_client_secret,
+        "device_identifier": device_identifier,
+        "device_name": args.device_name,
+        "device_type": args.device_type,
+        "scope": "api",
+    }
+
+    login_url = f"{server}/identity/connect/token"
+    login_data = http_post_form(login_url, login_payload)
+
+    access_token = login_data.get("access_token")
+    kdf_iterations = login_data.get("KdfIterations")
+
+    if not access_token or not kdf_iterations:
+        sys.stderr.write("Login response missing access_token or KdfIterations.\n")
+        sys.exit(1)
+
+    master_key = derive_master_key_pbkdf2(
+        password=args.master_password,
+        email=args.email,
+        iterations=int(kdf_iterations),
+    )
+    master_password_hash = compute_master_password_auth_hash(
+        master_key, args.master_password
+    )
+
+    purge_url = f"{server}/api/ciphers/purge"
+    purge_payload = {"masterPasswordHash": master_password_hash}
+
+    http_post_json(purge_url, purge_payload, access_token)
+    print("✅ Vault purged successfully")
 
 
 # -----------------------------------------------------------------------------
@@ -255,6 +354,26 @@ def main():
     parser_match.add_argument("source_file", help="Source JSON file")
     parser_match.add_argument("dest_file", help="Destination JSON file")
     parser_match.set_defaults(func=action_match)
+
+    parser_purge = subparsers.add_parser("purge", help="Purge vault contents")
+    parser_purge.add_argument("--server", "-s", required=True, help="Bitwarden server")
+    parser_purge.add_argument(
+        "--api-client-id", "-c", required=True, help="API client ID"
+    )
+    parser_purge.add_argument(
+        "--api-client-secret", "-S", required=True, help="API client secret"
+    )
+    parser_purge.add_argument("--email", "-e", required=True, help="Account email")
+    parser_purge.add_argument(
+        "--master-password", "-m", required=True, help="Master password"
+    )
+    parser_purge.add_argument(
+        "--device-name", default="bw.py", help="Device name for the API device"
+    )
+    parser_purge.add_argument(
+        "--device-type", default="script", help="Device type for the API device"
+    )
+    parser_purge.set_defaults(func=action_purge)
 
     args = parser.parse_args()
     args.func(args)
